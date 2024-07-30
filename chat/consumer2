@@ -1,0 +1,153 @@
+import json
+from channels.generic.websocket import AsyncWebsocketConsumer
+from channels.exceptions import StopConsumer
+from channels.db import database_sync_to_async
+from ed_tech_gamification.child.models import Room, ClanMessage
+from ed_tech_gamification.users.models import User
+
+
+@database_sync_to_async
+def get_room(code):
+    return Room.objects.get(name=code)
+
+
+@database_sync_to_async
+def add_online(code, user):
+    return Room.objects.get(name=code).online.add(User.objects.get(id=user))
+
+
+@database_sync_to_async
+def make_offline(code, user):
+    return Room.objects.get(name=code).online.remove(User.objects.get(id=user))
+
+
+@database_sync_to_async
+def get_message(room):
+    try:
+        message = ClanMessage.objects.get(room=room)
+    except ClanMessage.DoesNotExist:
+        message = []
+    return message
+
+
+@database_sync_to_async
+def get_online_user(code):
+    room = Room.objects.get(name=code).online.all()
+    room = [{"name": user.name, "id": user.id} for user in room]
+    return room
+
+
+@database_sync_to_async
+def get_user(id):
+    print(f'---------------------------{id}-------------------------------------')
+    name = User.objects.get(id=id).name
+    return name
+
+
+def create_message(user, room, content):
+    ClanMessage.objects.create(user=user, room=room, content=content)
+    return None
+
+
+class ChatRoomConsumer(AsyncWebsocketConsumer):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.clan_code = None
+        self.room_group_name = None
+        self.room = None
+        self.id = None
+        self.user = None
+
+    async def connect(self):
+        self.clan_code = self.scope['url_route']['kwargs']['room_name']
+        self.room_group_name = f'chat_{self.clan_code}'
+        self.room = await get_room(self.clan_code)
+        self.user = self.scope['user']
+
+        # join the room group
+        await self.channel_layer.group_add(
+            self.room_group_name,
+            self.channel_name,
+        )
+
+        await self.accept()
+        await add_online(self.clan_code, self.user.id)
+
+        messages = await get_message(self.room)
+        for message in messages:
+            await self.send(text_data=json.dumps({
+                'type': 'chat_message',
+                'message': message.content,
+                'sender': message.user.name,
+            }))
+
+        online_users = await get_online_user(self.clan_code)
+        for user in online_users:
+            await self.send(text_data=json.dumps({
+                'type': 'user_list',
+                'users': user,
+            }))
+
+        await self.channel_layer.group_send(
+            self.room_group_name,
+            {
+                'type': 'user_join',
+                'users': {"name": self.user.name, "id": self.user.id},
+            }
+        )
+
+    async def disconnect(self, close_code):
+
+        await make_offline(self.clan_code, self.user.id)
+        await self.channel_layer.group_send(
+            self.room_group_name,
+            {
+                'type': 'user_leave',
+                'user': str(self.user.id),
+            }
+        )
+
+        await self.channel_layer.group_discard(
+            self.room_group_name,
+            self.channel_name,
+        )
+        raise StopConsumer()
+
+    async def receive(self, text_data=None, bytes_data=None):
+        text_data_json = json.loads(text_data)
+        message = text_data_json.get('message')
+        sender = text_data_json.get('sender')
+        typing_user = text_data_json.get('typing_user')
+        # send chat message event to the room
+        if message:
+            await self.channel_layer.group_send(
+                self.room_group_name,
+                {
+                    'type': 'chat_message',
+                    'messages': {'message': message,
+                                 'sender': sender,
+                                 }
+                }
+            )
+        user = await get_user(typing_user)
+        await self.channel_layer.group_send(
+            self.room_group_name,
+            {
+                'type': 'typing',
+                'messages': {'typing_user': user,
+                             }
+            }
+        )
+
+    async def chat_message(self, event):
+        await self.send(text_data=json.dumps(event))
+
+    async def user_join(self, event):
+        await self.send(text_data=json.dumps(event))
+
+    async def user_leave(self, event):
+        await self.send(text_data=json.dumps(event))
+
+    async def typing(self, event):
+        await self.send(text_data=json.dumps(event))
